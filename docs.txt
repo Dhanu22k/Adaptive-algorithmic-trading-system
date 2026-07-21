@@ -1,0 +1,672 @@
+
+Intraday NSE Opening Range Breakout Strategy
+Theoretical Architecture Document v1.4 — Final
+Changes from v1.3 are marked with ⚡
+This is the definitive architecture document. No further review rounds planned.
+Next step: implementation.
+
+1. Problem Statement
+Goal: An algorithmic intraday trading system for NSE markets that:
+
+Detects strong directional momentum after the opening session establishes a clear range
+Enters only on confirmed, high-quality pullback setups with multi-condition validation
+Exits with profit or cuts loss before end of day
+Never holds overnight
+Operates within ₹1 lakh capital during the validation phase
+
+Constraints:
+
+Pure intraday — all positions squared off by 3:15 PM IST
+Capital: ₹1,00,000 (validation phase only — see D8)
+Instrument: NSE cash equities only at this capital level
+Architecture broker-agnostic — data source is swappable
+Minimum gross target per trade: 0.6%
+
+
+2. Instrument Selection
+2.1 Capital Reality
+Bank Nifty Futures (lot: 30 units, late 2024):
+  Margin ≈ ₹80,000–90,000 = 80–90% of capital
+  Max stop-loss space = ₹1,000 / 30 = ₹33/unit
+  Typical morning ATR = 60–120 points
+  → Stop inside one candle's noise. Unviable.
+
+F&O minimum capital: ₹2,50,000–₹3,00,000
+Equity meaningful return: ₹2,50,000+
+₹1L = validation only (see D8)
+2.2 Recommended Instruments
+StockSector IndexGap ThresholdHDFCBANK.NS^NSEBANK0.8%ICICIBANK.NS^NSEBANK0.8%RELIANCE.NS^CNX5000.8%INFY.NS^CNXIT0.8%TCS.NS^CNXIT0.8%
+2.3 InstrumentConfig Parameters ⚡
+ticker                    NSE symbol
+sector_index              mapped sector index ticker
+gap_threshold             instrument-specific Regime 2 trigger
+lot_size                  for future F&O use, runtime config only
+is_earnings_day           boolean, populated from calendar each session
+is_corporate_event_day    boolean, populated from calendar each session
+earnings_calendar_source  where dates come from (see W21)
+
+3. Data Architecture
+3.1 Primary Timeframe
+5-minute bars. All feeds normalized to bar-close timestamps before any feature computation. ⚡
+3.2 Data Requirements
+Meaningful backtest:     1 year 5-min OHLCV minimum
+Walk-forward:            2 years train + 6 months test, 5+ folds
+Statistical validity:    80+ completed out-of-sample trades
+yfinance 5-min:          last ~60 days → plumbing tests only
+3.3 Data Source Abstraction
+DataSource (abstract)
+    ├── YFinanceSource      60 days, plumbing only
+    ├── ZerodhaKiteSource   historical + live ← primary
+    ├── AngelOneSource      historical + live ← alternative
+    └── LocalCSVSource      saved files, offline
+3.4 Data Quality Requirements ⚡
+Timestamp normalization (mandatory):
+Different providers use bar-open or bar-close timestamps.
+Stock feed and sector index feed misaligned by 1 minute
+→ sector features silently wrong, no error thrown.
+
+Requirement: normalize ALL feeds to bar-close timestamps
+before any feature computation. Non-negotiable.
+RVOL_ToD rolling window (mandatory leakage guard):
+WRONG: compute time-slot volume means across full dataset.
+→ Uses future sessions to normalize past sessions.
+→ Silent leakage. Inflates backtest win rate. No error.
+
+CORRECT: at any time T, RVOL_ToD denominator uses only
+sessions prior to T. Expanding or rolling window only.
+Must be explicitly implemented — will not happen
+automatically.
+Missing bar detection: ⚡
+NSE 5-min feeds occasionally have missing bars or
+duplicate timestamps within a session.
+Missing bars corrupt VWAP, bars_since_Phase_A counter,
+and OR identification — silently.
+
+Required: compare expected bar count to actual bar count
+per session. On mismatch: forward-fill or skip session.
+Log all sessions with bar gaps detected.
+Corporate action adjustment:
+Price-adjusted for splits, bonuses, dividends. Verify against NSE bhav copy.
+Survivorship bias:
+Backtest must include historically delisted or removed stocks, not only today's survivors.
+Expiry tagging:
+Each bar tagged is_weekly_expiry and is_monthly_expiry from NSE trading calendar.
+
+4. Configuration Layer ⚡ (new section)
+All tunable parameters stored in a single YAML or JSON config file. Engine logic reads from config — nothing is hardcoded. Changing a parameter requires editing one file, not the source code. This is mandatory for controlled parameter sensitivity testing.
+yaml# strategy_config.yaml
+
+data:
+  interval: "5m"
+  period: "60d"
+  timestamp_convention: "bar_close"
+  rvol_lookback_sessions: 20
+  missing_bar_strategy: "forward_fill"  # or "skip_session"
+
+opening_range:
+  or_duration_bars: 3            # 15 minutes = 3 bars of 5-min data
+  or_min_size_pct: 0.003         # below this = Choppy (Regime 1)
+  or_max_size_pct: 0.010         # above this = Wide-Gap (Regime 2)
+
+phase_a:
+  breakout_buffer_pct: 0.0015    # 0.15% minimum above OR_H
+  close_position_min: 0.65       # closes in top 35% of bar range
+  rvol_threshold: 1.5            # vs time-of-day adjusted average
+  max_wait_bars: 5               # hard cutoff ⚡ (was 8 in v1.3)
+  min_remaining_bars: 4          # abandon if < 4 bars to 2:30 PM
+
+phase_a_invalidation:
+  i1_orh_breach_pct: 0.0010      # close below OR_H by this % → cancel
+  i2_sector_vwap_bars: 2         # consecutive bars below sector VWAP ⚡
+  i2_vwap_min_bar: 13            # apply I2 only after bar 13 (10:15AM) ⚡
+  i4_extension_atr_mult: 1.5     # highest_high > OR_H + 1.5×ATR → cancel ⚡
+
+phase_b_scoring:
+  min_score: 3
+  vwap_above_points: 2           # S1
+  vwap_proximity_points: 1       # S2 (conditional on S1)
+  vwap_proximity_max_pct: 1.0    # S2 threshold
+  sector_aligned_points: 2       # S3
+  pullback_shallow_points: 1     # S4
+  pullback_depth_max: 0.50       # S4 threshold
+  positive_body_points: 1        # S5
+  above_pdh_points: 1            # S6
+
+risk:
+  capital: 100000
+  max_risk_per_trade_pct: 0.01
+  max_daily_loss_pct: 0.02
+  max_notional_pct: 0.25
+  stop_atr_mult: 1.5
+  target_atr_mult: 2.5
+  min_gross_target_pct: 0.60
+  trail_at_target_pct: 0.50      # trail activates at 50% of target
+
+session:
+  entry_start: "09:30"
+  entry_cutoff: "14:30"
+  squareoff_time: "15:15"
+
+regime:
+  weekly_expiry_action: "half_size"
+  monthly_expiry_action: "skip"
+  earnings_day_action: "skip"
+  corporate_event_action: "skip"
+
+5. Core Strategy Logic ⚡
+5.1 Why Pullback Entry (D4)
+Pure breakout entry is the primary victim of institutional stop-hunts on NSE. Pullback entry filters most false breakouts at the cost of missing fast no-pullback trending days. Accepted tradeoff. See D4.
+5.2 Two-Phase Entry Structure
+PHASE A — SETUP BAR:
+  First bar to close above OR_H with volume and quality.
+  System enters wait state. No order placed.
+
+PHASE B — ENTRY BAR:
+  Pullback/bounce bar. Price action only.
+  No volume or momentum requirement.
+  Entry at next bar's open.
+5.3 Intrabar Pullback Edge Case
+Phase A and Phase B may be the SAME bar if:
+  A1–A4 all pass
+  AND bar LOW <= OR_H (touched the level intrabar)
+  AND bar close position > 0.65
+
+Entry at next bar's open. Same execution as normal.
+This captures the fastest trending days where pullback
+happens within the breakout bar itself.
+5.4 Phase A Conditions — Setup Bar
+All four must be true on the same bar:
+A1: First bar to CLOSE > OR_H
+A2: CLOSE > OR_H × (1 + breakout_buffer_pct)      [config]
+A3: (close - low) / (high - low) > close_position_min [config]
+A4: Volume > rvol_threshold × RVOL_ToD             [config]
+Wait window: min(max_wait_bars, bars_until_entry_cutoff) ⚡
+If bars_until_entry_cutoff < min_remaining_bars when Phase A fires → abandon immediately.
+5.5 Phase A Invalidation Conditions ⚡
+Cancel setup and enter no-trade state for the session if ANY of:
+I1 (Failed breakout):
+  Any bar CLOSES below OR_H by > i1_orh_breach_pct    [config]
+  Breakout has failed, not pulled back.
+
+I2 (Sector reversal): ⚡
+  Sector index closes below its own intraday VWAP for
+  i2_sector_vwap_bars consecutive bars                 [config]
+  AND only after bar i2_vwap_min_bar (10:15 AM)        [config]
+  Before 10:15 AM: use sector gap direction as proxy.
+  Single-bar oscillations below sector VWAP are noise.
+  Two consecutive bars indicate genuine trend shift.
+
+I3 (Opposite signal):
+  OR_L breaks during the wait window.
+  Session direction has reversed.
+
+I4 (Extreme extension): ⚡
+  highest_high_since_break > OR_H + (ATR × i4_extension_atr_mult) [config]
+  Price has run too far before pulling back.
+  Stop/target math is no longer valid from this base.
+  The eventual pullback to OR_H would be extreme and
+  may indicate distribution, not accumulation.
+
+I5 (Daily loss limit hit during wait): ⚡
+  day_pnl <= -(capital × max_daily_loss_pct)
+  No new entries and no pending setups.
+  Active Phase A cancelled immediately.
+5.6 Phase B — Entry Conditions ⚡
+Mandatory (both must pass):
+B1: Bar LOW touched OR_H from above (pullback confirmed)
+B2: Bar CLOSE > OR_H (level held as support)
+Scoring (enter when score ≥ min_score = 3):
+ConditionPointsNotesS1: CLOSE > VWAP+2After 10:15 AM. Before: gap_direction > 0 = +2S2: Entry within vwap_proximity_max_pct of VWAP+1Only if S1 has passed ⚡S3: Sector index broke its own OR_H+2Same direction as tradeS4: pullback_depth_pct < pullback_depth_max+1Shallow pullbackS5: Entry bar close > entry bar open+1Buyers active at levelS6: Entry price > PDH+1Structural level cleared
+Hard cutoff at bar 5: ⚡
+IF bars_since_Phase_A >= max_wait_bars (5):
+  Cancel setup. Log as "abandoned — timeout".
+  Record: entry_score_at_bar_5, pullback_formed (yes/no),
+  and simulated_fill_price for post-hoc analysis.
+Off-by-one precision: ⚡
+bars_since_Phase_A is incremented starting from the bar after the Phase A bar. Bar 5 = 5 bars elapsed since Phase A, not Phase A + 5. Implement explicitly to avoid silent off-by-one.
+Time filter:
+
+After 9:30 AM
+Before entry_cutoff (2:30 PM)
+AND bars_until_entry_cutoff >= min_remaining_bars when Phase A fired
+
+5.7 Minimum Gross Target Filter
+gross_target_pct = (ATR × target_atr_mult) / entry_price × 100
+IF gross_target_pct < min_gross_target_pct: skip trade
+5.8 Short Entry
+Mirror of long. Phase A: close below OR_L, buffer below, close in bottom 35%, volume surge. Invalidation: close above OR_L, sector above VWAP, OR_H breaks. Phase B: bar HIGH touches OR_L from below, CLOSE < OR_L. Scoring mirror of long with sector broke OR_L.
+5.9 Trade Direction Rule
+First OR boundary broken sets session direction. No opposing trades. D2.
+
+6. Session Regime Classification
+6.1 Three Regimes
+Regime 0 — Trending:
+  gap_pct <= gap_threshold AND or_size_pct: 0.003–0.010
+  → Trade normally
+
+Regime 1 — Choppy:
+  or_size_pct < or_min_size_pct
+  → Skip all trades
+
+Regime 2 — Wide Gap / News:
+  gap_pct > gap_threshold OR or_size_pct > or_max_size_pct
+  → Skip all trades
+6.2 Hard Skip and Size Reduction ⚡
+Hard skip (no trades at all):
+  is_earnings_day = True
+  is_corporate_event_day = True
+  is_monthly_expiry = True
+  Regime 1 or Regime 2
+
+Fallback if earnings calendar unavailable: ⚡
+  Treat day as is_earnings_day = True for that stock
+  Skip rather than risk trading through event volatility
+
+Half size:
+  is_weekly_expiry = True
+
+7. Feature Engineering
+7.1 Setup Bar Features (Phase A bar)
+breakout_distance_pct      (close - OR_H) / OR_H × 100
+breakout_bar_close_pos     (close - low) / (high - low)
+setup_bar_rvol             volume / RVOL_ToD (rolling window)
+highest_high_since_break   initialized at Phase A close
+                           updated each bar during wait
+7.2 Entry Bar Features (Phase B bar)
+pullback_depth_pct         (highest_high_since_break - entry_bar_low)
+                           / (highest_high_since_break - OR_H)
+                           [uses highest_high not setup bar high] ⚡
+
+entry_to_vwap_pct          (entry_price - VWAP) / entry_price × 100
+bars_since_breakout        elapsed since Phase A
+entry_premium_over_orh     entry_price - OR_H
+                           [diagnostic: log per trade,
+                            flag if average > 0.20%]
+7.3 Price Features
+VWAP / OR_High / OR_Low / OR_Size_pct / Dist_OR_High_pct
+VWAP_Dist_pct / PDH / PDL / Dist_PDH_pct
+OR_H_vs_PDH               "above" / "below" / "within_0.2%"
+Weekly_High / Weekly_Low
+7.4 Volatility / Momentum / Volume Features
+ATR (14-bar Wilder EMA) / ATR_pct / Session_ATR / ATR_ratio
+Momentum_5bar             valid after bar 6, setup bar only
+RVOL_ToD                  expanding window, setup bar only
+7.5 Market Context Features
+Sector_5min_ret / Sector_relative_strength / Sector_OR_direction
+GIFT_Nifty_bias (where available)
+7.6 Session Context Features
+Session_elapsed / Gap_pct / Day_of_week
+Is_expiry / Is_earnings_day / Is_corporate_event
+VWAP_reliable (1 after bar 13) / Momentum_valid (1 after bar 6)
+Phase_A_active / bars_since_Phase_A / highest_high_since_break
+
+8. Risk Management Architecture ⚡
+8.1 Per-Trade Risk
+Stop:   Long  = entry - (ATR × stop_atr_mult)
+        Short = entry + (ATR × stop_atr_mult)
+
+Target: Long  = entry + (ATR × target_atr_mult)
+        Short = entry - (ATR × target_atr_mult)
+        Gross R:R = 1.67:1 / Net R:R ≈ 1.2:1
+Trailing Stop (corrected): ⚡
+At (trail_at_target_pct × target_distance) reached:
+  Move stop to entry_price + cost_per_share
+  cost_per_share = total_round_trip_cost / position_size
+
+NOT entry_price. "Breakeven" ignores costs = ₹60 loss.
+The correction locks in zero net P&L, not zero gross.
+Position Sizing:
+risk_per_trade = capital × max_risk_per_trade_pct
+stop_distance  = ATR × stop_atr_mult
+raw_size       = risk_per_trade / stop_distance
+cap_size       = (capital × max_notional_pct) / entry_price
+final_size     = min(raw_size, cap_size), whole shares
+
+Pre-entry: check gross_target_pct >= min_gross_target_pct
+8.2 Session-Level Rules
+Rule 1 — Daily loss limit:    day_pnl <= -(capital × 0.02)
+                               → no more trades (and cancel active Phase A)
+Rule 2 — Square-off:          3:15 PM IST, no exceptions
+Rule 3 — Calendar/regime:     hard skips and half-size per Section 6.2
+Rule 4 — Entry time window:   9:30 AM to 2:30 PM, >= 4 bars remaining
+Rule 5 — Direction lock:      first OR break sets session direction
+Rule 6 — Corrected trail:     at 50% target → entry + cost_per_share
+8.3 Performance Monitoring Layer
+Track per completed trade:
+  rolling_20_win_rate
+  rolling_20_profit_factor
+
+Pause if:
+  rolling_20_win_rate < 40%
+  rolling_20_profit_factor < 1.0 for 20+ trades
+8.4 Capital Allocation
+Total capital:          ₹1,00,000
+Max single trade risk:  ₹1,000 (1%)
+Max daily loss:         ₹2,000 (2%)
+Max notional:           ₹25,000 (25%)
+Reserve:                ₹75,000 (75%)
+
+9. Transaction Costs ⚡
+Cost ItemRateOn ₹24,000 tradeBrokerage₹20 × 2₹40.00STT0.025% sell side only₹6.00Exchange charges0.00335% both sides₹1.61GST18% × (brokerage + exchange)₹7.49SEBI charges₹10/crore₹0.48Stamp duty0.003% buy side only₹0.72Slippage (normal)0.02% per side₹9.60Normal round-trip~₹66 = 0.27%Slippage (stop exit)0.10% exit₹24.00Stop-exit round-trip~₹80 = 0.33%
+Honest annual return at ₹1L:
+Conservative (55% WR, 40 trades/year): -₹654 (loss)
+Viable      (62% WR, 40 trades/year):  +₹1,148 = 1.1%
+Good        (62% WR, larger ATR days): +₹2,430 = 2.4%
+
+₹1L annual return is 1–2.4% — below a liquid fund.
+₹1L = validation phase. Not return generation. See D8.
+
+10. Execution Model ⚡
+10.1 Order Sequence
+Phase A closes:
+  → Enter wait state
+  → Initialize highest_high_since_break = Phase A close
+  → Start bars_since_Phase_A counter
+  → No order placed
+
+Each bar during wait:
+  → Update highest_high_since_break
+  → Check I1–I5 invalidations
+  → Check window expiry (bar 5 cutoff) ⚡
+  → Log abandoned setups with simulated fill price ⚡
+
+Phase B bar closes (conditions met):
+  → Entry at NEXT bar's open
+    [not Phase B close — look-ahead bias]
+  → Stop and target orders placed immediately
+  → Trail activates at 50% of target distance
+
+3:15 PM:
+  → Cancel all pending orders
+  → Market order to close any open position
+10.2 Live Execution Timing Gap ⚡ (new)
+In live trading: Phase B bar closes → conditions evaluated
+→ order submitted → broker API processes → fill.
+
+This sequence takes 1–3 seconds on typical NSE broker APIs.
+The next bar begins printing immediately at bar close.
+If API call takes 2+ seconds, fill may be partway into
+the new bar — not at its open.
+
+Backtest assumes: fill at next bar's open price.
+Reality may be: 0.03–0.08% worse than open price.
+
+Action: measure broker API round-trip latency during
+paper trading phase. Log as a separate slippage component
+distinct from market-impact slippage.
+10.3 Intrabar Stop Simulation (Backtest)
+Long position on bar [t]:
+  bar low  <= stop_price  → fill at stop_price
+  bar high >= target      → fill at target_price
+  both hit same bar       → fill at stop_price (conservative)
+  3:15 PM bar             → fill at bar open
+
+11. Backtesting Architecture
+11.1 Event-Driven Loop ⚡
+Session start:
+  1. Populate is_earnings_day / is_corporate_event_day
+     from calendar. If unavailable → treat as True → skip
+  2. Check all hard-skip conditions → exit if triggered
+  3. Classify regime → exit if Regime 1 or 2
+  4. Check minimum ATR → exit if gross_target < 0.60%
+  5. Initialize session state:
+       Phase_A_active = False
+       bars_since_Phase_A = 0
+       highest_high_since_break = None
+       session_long_taken = False
+       day_pnl = 0.0
+
+For each bar (bar 4 onward):
+  a. Update all features with validity flags
+  b. If Phase_A_active:
+       → Update highest_high_since_break
+       → Check I1–I5 (invalidate if triggered)
+       → Check bar 5 hard cutoff
+          → If reached: log abandoned setup, cancel
+       → Evaluate Phase B (B1 + B2 + score ≥ 3)
+          → If passed: queue entry
+  c. If Phase_A_active = False AND no position:
+       → Evaluate A1–A4
+       → If all pass: set Phase_A_active = True
+       → Check intrabar edge case
+       → If bars_until_cutoff < min_remaining_bars: abandon
+  d. If position open:
+       → Intrabar stop/target check
+       → Trail update
+       → 3:15 PM square-off check
+  e. Check daily loss limit (I5 if Phase A active)
+  f. Log all state transitions and feature values
+11.2 Walk-Forward Validation
+Dataset:     2 years per instrument minimum
+Folds:       5 minimum
+Train/test:  2 years train, 6 months test, rolling
+Target:      80+ completed out-of-sample trades
+Stability:   ±20% on all config parameters
+             Results must not collapse
+
+12. Performance Metrics ⚡
+12.1 Primary (after all costs)
+Total P&L (₹) / Total Return (%)
+Win Rate (%)              target: > 58%
+Profit Factor             target: > 1.5
+Expectancy (₹/trade)      target: > ₹50 after costs
+Avg Win / Avg Loss        target: > 1.3:1 net
+Max Daily Drawdown (₹)
+Profitable Days / Total
+12.2 Diagnostic Breakdown ⚡
+By session regime
+By day of week
+By entry time slot
+By expiry vs non-expiry
+By OR_H vs PDH relationship
+By pullback depth tier
+By score tier (3 / 4 / 5 / 6+)
+By score composition (which conditions fired)
+By exit reason (Stop / Target / Trail / Square-off)
+By entry premium over OR_H
+  → flag if average > 0.20% (hidden cost detected)
+S1 + S3 co-occurrence rate
+  → flag if > 80% of high-score trades use both
+bars_since_Phase_A at entry distribution
+Abandoned setups log with simulated fills ⚡
+  → post-hoc analysis after 80+ live trades
+
+13. Known Weaknesses ⚡
+W1 — OR window fixed at 15 minutes. May not be optimal.
+W2 — RVOL threshold (1.5x) is heuristic. Needs empirical validation.
+W3 — Regime classification is rule-based. Static thresholds may not generalize.
+W5 — VWAP as sole trend filter post-10:15. ADX would add strength, complexity tradeoff unresolved.
+W6 — Gap thresholds are heuristic per instrument.
+W8 — Breakout buffer (0.15%) and window length are heuristic.
+W9 — Expiry day behaviour: skip vs half-size needs empirical study.
+W11 — Choppy regime not always detectable at 9:30 AM.
+W12 — Pullback entry misses fast trending days. Quantify miss rate in backtesting.
+W13 — Parameter overfitting (highest priority). 15+ tunable parameters, ~500 sessions/year/instrument. Walk-forward necessary but not sufficient. ±20% stability test mandatory.
+W14 — Strategy decay. ORB is widely published. Rolling monitor in Section 8.3 detects it.
+W15 — Circuit breaker handling. Flag sessions where stock hit price band in backtesting.
+W16 — Correlated sector exposure. Max 1 position per sector at a time.
+W17 — Corporate events and earnings days. ⚡
+Gap filter alone insufficient for scheduled intraday events. is_earnings_day flag addresses this architecturally but requires a reliable earnings calendar. See W21.
+W18 — RVOL_ToD data leakage. ⚡
+Must use expanding/rolling window only. Will not throw an error if implemented incorrectly. Explicit implementation requirement in Section 3.4.
+W19 — Sector index timestamp synchronization. ⚡
+All feeds normalized to bar-close timestamps. Silent data corruption if misaligned.
+W20 — S1/S3 scoring correlation. ⚡
+Both S1 (above VWAP) and S3 (sector aligned) tend to be true simultaneously on strong days. A score of 4 via S1+S3 is less independent evidence than 4 points from uncorrelated conditions. Monitor via co-occurrence diagnostic.
+W21 — Earnings calendar data source unspecified (new, highest operational priority): ⚡
+The architecture hard-skips earnings days via is_earnings_day.
+But NSE does not provide a free, reliable, machine-readable
+earnings calendar.
+
+Options (in order of reliability):
+  1. Paid service (Refinitiv, Bloomberg, Quandl, Sensibull)
+  2. NSE website scraping (fragile, maintenance burden)
+  3. Manual maintenance (error-prone at scale)
+
+Required: specify source, update process, and fallback.
+Fallback must be: treat day as earnings day → skip.
+Never trade through an unverified earnings event.
+
+This is the highest-priority operational dependency.
+Resolve before writing any code.
+W22 — Intraday missing bars / data gaps (new): ⚡
+NSE 5-min feeds occasionally have missing or duplicate bars.
+Missing bars silently corrupt: VWAP (wrong denominator),
+bars_since_Phase_A counter, OR identification.
+No error is thrown.
+
+Required:
+  → Compare expected to actual bar count each session
+  → Choose fill strategy (forward-fill or skip session)
+  → Log all gap-affected sessions
+  → Exclude gap-affected sessions from performance stats
+    unless fill strategy is explicitly validated
+W23 — Live execution timing gap (new): ⚡
+Phase B bar closes → evaluate conditions → submit order
+→ broker API → fill.
+This takes 1–3 seconds. Next bar begins immediately.
+
+Backtest assumes fill at next bar open.
+Live may be 0.03–0.08% worse.
+
+Measure API round-trip latency in paper trading phase.
+Log as separate slippage component.
+
+14. Explicit Design Decisions
+D1 — No re-entry after stop-out or invalidation. Prevents overtrading.
+D2 — First-break direction only, one trade per session.
+D3 — Equity only at ₹1L. F&O incompatible at current index levels.
+D4 — Pullback entry over raw breakout. Core strategy decision.
+D5 — Fixed ATR target as primary exit with corrected breakeven trail.
+D6 — Minimum 0.6% gross target filter. Cost math does not support smaller.
+D7 — Sector index, not Nifty 50, for relative strength.
+D8 — ₹1L is the validation phase, not return-generation phase: ⚡
+Expected annual return at ₹1L: 1–2.4% (below liquid fund)
+
+The purpose of ₹1L trading:
+  → Validate live win rate and profit factor
+  → Discover execution/API issues at low cost
+  → Build verified trade record for walk-forward
+  → Confirm architecture behaves as designed
+
+Three-phase progression:
+  Phase 0 (3 months): Paper trading alongside backtester
+    → Confirm data feed matches expected format
+    → Confirm Phase A/B logic fires when expected
+    → Confirm calendar updates are operational
+    → Zero capital at risk
+  Phase 1 (80+ live trades): ₹1,00,000
+    → Validate live win rate > 58%
+    → Validate profit factor > 1.5
+    → Measure real execution slippage and API latency
+    → Confirm rolling monitor behaves correctly
+  Phase 2 (after Phase 1 validated): ₹2,50,000–₹5,00,000
+    → Scale only after live metrics confirmed
+    → Do not scale based on backtest alone
+
+Do not skip Phase 0. Paper trading reveals data pipeline
+issues at zero cost that would otherwise consume capital.
+
+15. Component Summary
+InstrumentConfig          ticker, sector index, gap threshold,
+                          expiry calendar, earnings calendar,
+                          earnings_calendar_source
+
+DataSource (abstract)     yfinance → ZerodhaKite / Angel One
+                          timestamp normalization mandatory
+                          missing bar detection mandatory
+
+SessionFeatureEngineer    raw 5-min → all features with
+                          validity flags, expanding RVOL window,
+                          highest_high_since_break tracker
+
+IntradayRegimeClassifier  Trending / Choppy / Wide-Gap
+                          + all calendar-based hard skips
+                          + fallback for missing calendar data
+
+TwoPhaseSignalModel       Phase A: A1–A4 setup detection
+                            + intrabar edge case
+                          Phase A wait state:
+                            highest_high_since_break update
+                            I1–I5 invalidation checks
+                            bar 5 hard cutoff + logging
+                          Phase B: B1–B2 mandatory
+                                  + scoring (S2 conditional on S1)
+                                  + minimum score = 3
+
+IntradayRiskManager       sizing, corrected trail (entry + cost),
+                          daily limits, square-off, gross target
+                          filter, I5 linkage, rolling monitor
+
+IntradayBacktestEngine    event-driven per Section 11.1,
+                          intrabar stops, multi-feed processing,
+                          abandoned setup logging
+
+PerformanceAnalyzer       full diagnostics per Section 12.2
+                          including entry premium, score
+                          composition, S1+S3 co-occurrence,
+                          abandoned setup post-hoc analysis
+
+16. Implementation Order ⚡ (new section)
+BEFORE WRITING CODE:
+  → Resolve W21: identify earnings calendar data source
+  → If no reliable source: document fallback explicitly
+
+Step 1 — Data Pipeline
+  → Timestamp normalization across all feeds
+  → RVOL_ToD with expanding window (no leakage)
+  → Missing bar detection and fill strategy
+  → Earnings calendar integration and fallback
+  → Validate on HDFCBANK 60-day yfinance data
+    (plumbing only — not statistical)
+
+Step 2 — SessionFeatureEngineer
+  → All features with validity flags
+  → highest_high_since_break tracker
+  → Setup bar vs entry bar feature separation
+  → VWAP_reliable and Momentum_valid flags
+
+Step 3 — TwoPhaseSignalModel
+  → Phase A detection (A1–A4)
+  → Invalidation conditions (I1–I5)
+  → Intrabar edge case handling
+  → Bar 5 hard cutoff with abandoned setup logging
+  → Phase B scoring with S2 conditional on S1
+
+Step 4 — IntradayRiskManager
+  → Position sizing with notional cap
+  → Corrected trailing stop (entry + cost_per_share)
+  → Minimum gross target filter
+  → I5 linkage to daily loss limit
+  → Rolling performance monitor
+
+Step 5 — IntradayBacktestEngine
+  → Event-driven loop per Section 11.1
+  → Intrabar stop simulation
+  → Session state initialization and teardown
+  → Full logging of all state transitions
+
+Step 6 — PerformanceAnalyzer
+  → All diagnostics per Section 12.2
+  → Entry premium metric
+  → Score composition tracking
+  → S1+S3 co-occurrence rate
+  → Abandoned setup simulation
+
+Step 7 — Configuration Layer
+  → Load all parameters from strategy_config.yaml
+  → No hardcoded values anywhere in engine
+
+Step 8 — Paper Trading (3 months)
+  → Run live against incoming data
+  → Verify Phase A/B fire as expected
+  → Measure API latency (W23)
+  → Confirm calendar updates operational
+
+Step 9 — Live Trading Phase 1 (₹1L, 80+ trades)
+  → Track all metrics per Section 12.1
+  → Compare to backtest expectations
+  → Do not scale until validated
+
+Step 10 — Scale to Phase 2 (₹2.5L+)
+  → Only after Phase 1 metrics confirmed
