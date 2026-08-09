@@ -4,20 +4,27 @@ config.py — Central configuration for all ORB trading system scripts
 Single import for credentials + settings. All pipeline files use:
     from config import CREDENTIALS, SETTINGS
 
-Credentials are loaded from .env (never hardcoded).
-Settings (cache path, risk params, instruments) live here.
+Credentials are loaded from .env (never hardcoded, never committed).
+Settings (cache path, risk params, instruments) are loaded from
+settings.yaml (v1.4 spec Section 4: "nothing is hardcoded" -- Step 7).
+
+Nothing downstream changed: SETTINGS is still the same Settings dataclass
+with the same attribute names as before. core/*.py and run_*.py files
+need zero changes for this migration.
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import List
 
+import yaml
 from dotenv import load_dotenv
 
-# ── Locate project root and .env ───────────────────────────────────────────────
-_PROJECT_ROOT = Path(__file__).parent.resolve()
-_ENV_FILE     = _PROJECT_ROOT / ".env"
+# ── Locate project root, .env, and settings.yaml ───────────────────────────────
+_PROJECT_ROOT   = Path(__file__).parent.resolve()
+_ENV_FILE       = _PROJECT_ROOT / ".env"
+_SETTINGS_FILE  = _PROJECT_ROOT / "settings.yaml"
 
 if not _ENV_FILE.exists():
     raise FileNotFoundError(
@@ -55,8 +62,12 @@ print(f"[Config] Credentials loaded from .env  (client: {CREDENTIALS['client_id'
 @dataclass
 class Settings:
     """
-    Central settings for the ORB strategy system.
-    Add new knobs here as each step is built — keeps all params in one place.
+    Central settings for the ORB strategy system. Values are loaded from
+    settings.yaml (see Settings.from_yaml below) -- the defaults declared
+    here only kick in if a key is MISSING from the YAML file, so a partial
+    settings.yaml never crashes the whole system, it just silently falls
+    back per-field. Add new knobs here (with a sensible default) as each
+    step is built, then add the matching key to settings.yaml.
     """
 
     # ── Data pipeline (Step 1) ─────────────────────────────────────────────────
@@ -67,7 +78,7 @@ class Settings:
 
     # ── Session feature engineer (Step 2) ─────────────────────────────────────
     or_end_bar:      int   = 3             # bars to define opening range (3 x 5min = 15min) -- v1.4 spec
-    breakout_buffer_pct: float = 0.0015    # A2: close must clear OR_H by this % (v1.4 spec, was missing)
+    breakout_buffer_pct: float = 0.0015    # A2: close must clear OR_H by this % (v1.4 spec)
     entry_cutoff:    str   = "14:30"       # no new entries after this IST time
     squareoff_time:  str   = "15:15"       # hard square-off IST time
 
@@ -80,9 +91,8 @@ class Settings:
     # ── Risk management (Step 4) ───────────────────────────────────────────────
     capital:          float = 100000.0     # Rs 1L validation-phase capital
     risk_per_trade_pct: float = 0.01       # 1% of capital risked per trade (Rs 1,000)
-                                            # -> 2 stopped-out trades = exactly the daily limit below
-    atr_stop_mult:   float = 1.5           # stop = ATR × 1.5
-    atr_target_mult: float = 2.5           # target = ATR × 2.5
+    atr_stop_mult:   float = 1.5           # stop = ATR x 1.5
+    atr_target_mult: float = 2.5           # target = ATR x 2.5
     min_gross_move:  float = 0.006         # skip trade if ATR < 0.6% (too small)
     daily_loss_limit: float = 2000.0       # Rs 2,000 daily stop (2% of Rs 1L capital)
     max_position_pct: float = 0.25         # max 25% of capital in one position
@@ -97,5 +107,42 @@ class Settings:
         default_factory=lambda: ["HDFCBANK", "ICICIBANK", "RELIANCE", "INFY", "TCS"]
     )
 
+    @classmethod
+    def from_yaml(cls, yaml_path: Path) -> "Settings":
+        """
+        Loads settings.yaml (a nested dict, grouped into sections like
+        data_pipeline/session_features/etc. for readability) and flattens
+        it into this dataclass's fields. Any field NOT found in the YAML
+        silently keeps its dataclass default above -- missing/partial
+        settings.yaml never crashes the system, unlike missing .env values
+        (which DO hard-fail, since those are genuine secrets with no safe
+        default).
+        """
+        if not yaml_path.exists():
+            print(f"[Config] ⚠ {yaml_path.name} not found — using built-in defaults for all settings.")
+            return cls()
 
-SETTINGS = Settings()
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+        # Flatten: settings.yaml groups keys into sections for readability
+        # (data_pipeline, session_features, ...) but Settings itself is flat.
+        flat: dict = {}
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                flat.update(value)      # a section — merge its keys up
+            else:
+                flat[key] = value       # a top-level key (e.g. instruments)
+
+        valid_field_names = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in flat.items() if k in valid_field_names}
+
+        unknown = set(flat) - valid_field_names
+        if unknown:
+            print(f"[Config] ⚠ {yaml_path.name} has unrecognized key(s), ignored: {sorted(unknown)}")
+
+        return cls(**kwargs)
+
+
+SETTINGS = Settings.from_yaml(_SETTINGS_FILE)
+print(f"[Config] Settings loaded from {_SETTINGS_FILE.name}")

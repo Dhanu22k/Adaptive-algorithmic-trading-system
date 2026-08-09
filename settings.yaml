@@ -1,0 +1,50 @@
+# ══════════════════════════════════════════════════════════════════════════
+# settings.yaml — Adaptive Algorithmic Trading System
+# ══════════════════════════════════════════════════════════════════════════
+# All tunable parameters live here. Nothing should be hardcoded in core/*.py
+# or run_*.py — that's the whole point of Step 7 (v1.4 architecture spec,
+# Section 4: "Engine logic reads from config — nothing is hardcoded").
+#
+# Credentials (API keys, TOTP secret) are NOT here — they stay in .env,
+# which is gitignored. This file is safe to commit.
+# ══════════════════════════════════════════════════════════════════════════
+
+data_pipeline:          # Step 1
+  cache_dir: data_cache
+  history_days: 30       # lookback window for historical fetch
+  interval: FIVE_MINUTE   # Angel One interval code
+  max_age_hours: 20        # cache TTL — refresh after market close
+
+session_features:        # Step 2
+  or_end_bar: 3                    # bars to define opening range (3 x 5min = 15min) -- v1.4 spec
+  breakout_buffer_pct: 0.0015       # A2: close must clear OR_H by this % (v1.4 spec)
+  entry_cutoff: "14:30"              # no new entries after this IST time
+  squareoff_time: "15:15"             # hard square-off IST time
+
+signal_model:            # Step 3
+  rvol_threshold: 1.5              # min RVOL for Phase A setup bar
+  close_pos_min: 0.65                # min close position within bar for Phase A
+  max_pullback_bars: 5                 # hard cutoff: cancel setup after 5 bars
+  score_threshold: 3                     # Phase B min score (out of 8)
+
+risk_management:         # Step 4
+  capital: 100000.0                # Rs 1L validation-phase capital
+  risk_per_trade_pct: 0.01           # 1% of capital risked per trade (Rs 1,000)
+                                       # -> 2 stopped-out trades = exactly the daily limit below
+  atr_stop_mult: 1.5                    # stop = ATR x 1.5
+  atr_target_mult: 2.5                    # target = ATR x 2.5
+  min_gross_move: 0.006                     # skip trade if ATR < 0.6% (too small)
+  daily_loss_limit: 2000.0                    # Rs 2,000 daily stop (2% of Rs 1L capital)
+  max_position_pct: 0.25                        # max 25% of capital in one position
+  trail_trigger_pct: 0.50                         # move stop to breakeven+costs at 50% of target reached
+
+transaction_costs:        # Step 4
+  txn_cost_normal_pct: 0.0027       # ~Rs 66 round trip on target/squareoff exits
+  txn_cost_stop_pct: 0.0033           # ~Rs 80 round trip on stop exits (extra slippage)
+
+instruments:
+  - HDFCBANK
+  - ICICIBANK
+  - RELIANCE
+  - INFY
+  - TCS
