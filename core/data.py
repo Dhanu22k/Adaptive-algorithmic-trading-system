@@ -370,7 +370,24 @@ class HistoricalDataFetcher:
         headers = self.auth.get_auth_headers()
         resp = requests.post(self.HIST_URL, headers=headers,
                              json=payload, timeout=20)
-        data = resp.json()
+
+        # Diagnostic: reveal WHY a non-JSON response happened, instead of
+        # crashing blind on resp.json(). Empty body / non-200 status is
+        # commonly a silent IP block or rate limit from the broker's side,
+        # not a code bug -- this makes that visible instead of guessing.
+        if resp.status_code != 200:
+            print(f"  [Fetch] HTTP {resp.status_code} — {resp.reason}")
+            print(f"  [Fetch] Response body (first 500 chars): {resp.text[:500]!r}")
+            print(f"  [Fetch] Response headers: {dict(resp.headers)}")
+            return []
+
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"  [Fetch] Non-JSON response despite HTTP 200. "
+                  f"Body (first 500 chars): {resp.text[:500]!r}")
+            return []
+
         if not data.get("status"):
             print(f"  [Fetch] Warning: {data.get('message')} "
                   f"(token={token}, {from_dt.date()} to {to_dt.date()})")
@@ -639,11 +656,56 @@ class AngelDataPipeline:
         self.validator = DataValidator()
         self.cache     = LocalCache(cache_dir)
 
+    # RVOL_ToD needs prior sessions WITHIN the same fetch to build its
+    # expanding-window baseline (see RVOLCalculator) — it has no memory of
+    # earlier script runs. Without a buffer, whichever ~3 calendar days land
+    # at the very start of a `days`-sized fetch get rvol_tod=NaN (i<3 in
+    # RVOLCalculator), and the next several past that have only a thin,
+    # noisy few-day baseline. This makes Phase A/B detection for early-window
+    # sessions silently depend on exactly where the 30-day window happened to
+    # start on a given run -- the same calendar day can gain or lose a signal
+    # purely based on run timing, with no code change and no market change.
+    #
+    # Fix: fetch `days + WARMUP_CALENDAR_DAYS` extra calendar days, compute
+    # RVOL over that full extended range (so the requested `days` window is
+    # fully warmed up), then trim back down to exactly `days` before caching
+    # or returning. ~30 calendar days covers RVOLCalculator's
+    # lookback_sessions=20 trading-day cap even after weekends/holidays.
+    WARMUP_CALENDAR_DAYS = 30
+
+    def _fetch_compute_trim(
+        self, config: InstrumentConfig, days: int, validate_label: str
+    ) -> pd.DataFrame:
+        """Shared fetch -> gap-check -> RVOL -> trim -> validate pipeline.
+        Used for BOTH stock and sector fetches so both get a properly
+        warmed-up RVOL_ToD baseline and identical treatment — previously
+        this logic was duplicated (and had drifted slightly) between
+        fetch() and fetch_with_sector()."""
+        fetch_days = days + self.WARMUP_CALENDAR_DAYS
+        df = self.fetcher.fetch_full_history(config, days=fetch_days)
+        if df.empty:
+            raise ValueError(f"No data returned for {config.ticker}")
+
+        df = self.gap_check.check(df)  # Missing bar detection (W22)
+
+        print("[RVOL] Computing time-of-day relative volume...")
+        df = self.rvol_calc.compute(df)  # expanding window over the FULL fetch — no leakage (W18)
+
+        # Trim the warm-up buffer back off — it existed only to give RVOL_ToD
+        # a real baseline, it isn't part of what the caller actually asked for.
+        cutoff = df.index.max() - pd.Timedelta(days=days)
+        df = df[df.index > cutoff]
+
+        self.validator.validate(df, validate_label)
+        return df
+
     def fetch(self, config: InstrumentConfig,
               days: int = 365,
               use_cache: bool = True) -> pd.DataFrame:
         """Full pipeline for one instrument. Returns clean DataFrame
-        ready for SessionFeatureEngineer.
+        ready for SessionFeatureEngineer, with a properly warmed-up
+        RVOL_ToD baseline for every session in the returned window
+        (see WARMUP_CALENDAR_DAYS above).
 
         Columns:
           open, high, low, close, volume   — OHLCV (float)
@@ -657,24 +719,8 @@ class AngelDataPipeline:
         if use_cache and self.cache.exists(cache_key):
             return self.cache.load(cache_key)
 
-        # Fetch stock data
-        df = self.fetcher.fetch_full_history(config, days=days)
-        if df.empty:
-            raise ValueError(f"No data returned for {config.ticker}")
-
-        # Missing bar detection (W22)
-        df = self.gap_check.check(df)
-
-        # RVOL_ToD with expanding window — no leakage (W18)
-        print("[RVOL] Computing time-of-day relative volume...")
-        df = self.rvol_calc.compute(df)
-
-        # Validate
-        self.validator.validate(df, config.ticker)
-
-        # Cache for next run
+        df = self._fetch_compute_trim(config, days, config.ticker)
         self.cache.save(cache_key, df)
-
         return df
 
     def fetch_with_sector(self, config: InstrumentConfig,
@@ -694,6 +740,7 @@ class AngelDataPipeline:
         # ── Cache check FIRST — avoids ScripMaster fetch when sector data is fresh ──
         if use_cache and self.cache.exists(sector_key):
             sector_df = self.cache.load(sector_key)
+            self._check_date_alignment(stock_df, sector_df, config)
             return stock_df, sector_df
 
         # ── Cache miss — resolve token then fetch fresh sector data ──
@@ -719,13 +766,44 @@ class AngelDataPipeline:
             gap_threshold = config.gap_threshold,
             name          = f"{config.sector_index} Proxy"
         )
-        sector_df = self.fetcher.fetch_full_history(sector_config, days=days)
-        sector_df = self.gap_check.check(sector_df)
-        sector_df = self.rvol_calc.compute(sector_df)
-        self.validator.validate(sector_df, config.sector_index)
+        sector_df = self._fetch_compute_trim(sector_config, days, config.sector_index)
         self.cache.save(sector_key, sector_df)
 
+        self._check_date_alignment(stock_df, sector_df, config)
         return stock_df, sector_df
+
+    @staticmethod
+    def _check_date_alignment(
+        stock_df: pd.DataFrame, sector_df: pd.DataFrame, config: "InstrumentConfig"
+    ) -> None:
+        """
+        Guards against a specific silent-drift bug: stock and sector data are
+        cached with INDEPENDENT 20h TTLs, so it's possible for one to be
+        re-fetched while the other still serves an older cached window. Both
+        might report similar row counts and look fine individually, while the
+        actual DATE RANGES no longer overlap correctly — corrupting sector-
+        relative features (I2, S3) for the misaligned days without any error.
+
+        This doesn't force a re-fetch (that would fight the caching system's
+        purpose) — it just makes the drift LOUD instead of silent, so a run
+        with misaligned caches is visibly flagged rather than quietly
+        producing subtly wrong signals.
+        """
+        stock_start,  stock_end  = stock_df.index.min(),  stock_df.index.max()
+        sector_start, sector_end = sector_df.index.min(), sector_df.index.max()
+
+        gap_start = abs((stock_start - sector_start).total_seconds()) / 86400
+        gap_end   = abs((stock_end   - sector_end).total_seconds())   / 86400
+
+        if gap_start > 2 or gap_end > 2:  # more than 2 calendar days apart
+            print(
+                f"[DateAlign] ⚠ {config.ticker} vs {config.sector_index} date ranges "
+                f"differ by {max(gap_start, gap_end):.1f} days "
+                f"(stock: {stock_start.date()}→{stock_end.date()}, "
+                f"sector: {sector_start.date()}→{sector_end.date()}). "
+                f"Caches likely drifted out of sync — consider deleting both "
+                f"parquet files and re-running for a clean joint fetch."
+            )
 
 
 # ---------------------------------------------------------------------------

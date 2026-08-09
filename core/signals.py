@@ -69,20 +69,22 @@ class SignalConfig:
     """All tunable thresholds in one place — matches SETTINGS in config.py."""
     rvol_threshold:      float = 1.5    # Phase A: min RVOL
     close_pos_min:       float = 0.65   # Phase A: min close position
+    breakout_buffer_pct: float = 0.0015 # A2: close must clear OR_H by this % (v1.4 spec)
     max_pullback_bars:   int   = 5      # Phase B: cancel setup after N bars
     score_threshold:     int   = 3      # Phase B: min score to enter
     i1_pct:              float = 0.001  # I1: close drops 0.1% below or_high
     i4_atr_mult:         float = 1.5    # I4: price ran > 1.5×ATR above or_high
     s2_vwap_pct:         float = 0.01   # S2: within 1% of VWAP
-    s4_pullback_max:     float = 0.50   # S4: pullback < 50% of (phase_a_close - or_high)
+    s4_pullback_max:     float = 0.50   # S4: pullback < 50% of (highest_high - or_high)
 
     @classmethod
     def from_settings(cls, settings) -> "SignalConfig":
         return cls(
-            rvol_threshold    = settings.rvol_threshold,
-            close_pos_min     = settings.close_pos_min,
-            max_pullback_bars = settings.max_pullback_bars,
-            score_threshold   = settings.score_threshold,
+            rvol_threshold      = settings.rvol_threshold,
+            close_pos_min       = settings.close_pos_min,
+            breakout_buffer_pct = settings.breakout_buffer_pct,
+            max_pullback_bars   = settings.max_pullback_bars,
+            score_threshold     = settings.score_threshold,
         )
 
 
@@ -91,9 +93,13 @@ class _SessionState:
     """Mutable state for one trading session — reset at each session boundary."""
     phase_a_bar_idx:  Optional[int]   = None
     phase_a_close:    Optional[float] = None
+    highest_high:     Optional[float] = None   # v1.4 "highest_high_since_break" — init at Phase A close, updated each wait bar
     bars_since_a:     int             = 0
     signal_fired:     bool            = False   # only one signal per session
     phase_a_seen:     bool            = False   # one Phase A attempt per session max
+    awaiting_fill:    bool            = False   # Phase B scored on prior bar -- fill at THIS bar's open (v1.4: no look-ahead)
+    pending_score:    int             = 0       # carried from trigger bar to fill bar, for output clarity
+    pending_depth:    Optional[float] = None    # carried from trigger bar to fill bar, for output clarity
 
     @property
     def waiting_for_b(self) -> bool:
@@ -162,6 +168,21 @@ class TwoPhaseSignalModel:
 
             bar_time = ts.time()
 
+            # ── Pending fill from PRIOR bar's Phase B trigger ──────────────────
+            # v1.4 10.1: "Entry at NEXT bar's open [not Phase B close —
+            # look-ahead bias]". The scoring decision was already made on the
+            # previous bar; this bar's job is purely mechanical: fill at open.
+            if state.awaiting_fill:
+                out.at[ts, "signal"]         = "LONG"
+                out.at[ts, "signal_price"]   = row["open"]
+                out.at[ts, "signal_bar_idx"] = row["bar_index"]
+                out.at[ts, "phase_b_score"]  = state.pending_score    # carried from trigger bar
+                out.at[ts, "pullback_depth"] = state.pending_depth    # carried from trigger bar
+                out.at[ts, "phase_a_bar_idx"] = state.phase_a_bar_idx
+                state.signal_fired  = True
+                state.awaiting_fill = False
+                continue
+
             # ── If waiting for Phase B ─────────────────────────────────────────
             if state.waiting_for_b:
                 state.bars_since_a += 1
@@ -172,10 +193,13 @@ class TwoPhaseSignalModel:
                     state.phase_a_close   = None
                     continue
                 else:
+                    # v1.4 7.1/10.1: update highest_high_since_break BEFORE
+                    # checking invalidations or scoring this bar.
+                    state.highest_high = max(state.highest_high, row["high"])
+
                     # Compute once — used by I1b invalidation AND S4 scoring below.
-                    # Must be computed BEFORE the invalidation check now (I1b needs it).
                     pullback_depth = self._pullback_depth(
-                        row, state.phase_a_close, row["or_high"]
+                        row, state.highest_high, row["or_high"]
                     )
 
                     # Check invalidation (I1a/I1b/I2/I3/I4) — cancel setup if triggered
@@ -186,6 +210,14 @@ class TwoPhaseSignalModel:
                         state.phase_a_close   = None
                         continue
                     else:
+                        # B1 (v1.4 5.6, mandatory): bar LOW must have touched
+                        # OR_H from above -- confirms a genuine pullback
+                        # occurred. If not touched, this bar simply isn't a
+                        # valid Phase B candidate; keep waiting (not an
+                        # invalidation -- the setup is still alive).
+                        if row["low"] > row["or_high"]:
+                            continue
+
                         # Score this bar as a potential Phase B entry
                         score = self._score_phase_b(row, pullback_depth, bar_time)
 
@@ -196,11 +228,11 @@ class TwoPhaseSignalModel:
                         out.at[ts, "phase_a_close"]   = state.phase_a_close
 
                         if score >= self.cfg.score_threshold and bar_time <= _14_30:
-                            # SIGNAL — mark entry bar
-                            out.at[ts, "signal"]          = "LONG"
-                            out.at[ts, "signal_price"]    = row["close"]
-                            out.at[ts, "signal_bar_idx"]  = row["bar_index"]
-                            state.signal_fired = True
+                            # Decision made -- but v1.4 requires the actual
+                            # fill on the NEXT bar's open, not this bar's close.
+                            state.awaiting_fill = True
+                            state.pending_score = score
+                            state.pending_depth = pullback_depth
                         continue   # don't double-check Phase A on a Phase B bar
 
             # ── Phase A detection ──────────────────────────────────────────────
@@ -217,6 +249,7 @@ class TwoPhaseSignalModel:
                 out.at[ts, "phase_a_close"]   = row["close"]
                 state.phase_a_bar_idx = row["bar_index"]
                 state.phase_a_close   = row["close"]
+                state.highest_high    = row["close"]  # v1.4 7.1: init at Phase A CLOSE
                 state.bars_since_a    = 0
                 state.phase_a_seen    = True   # lock — no further Phase A this session
 
@@ -231,7 +264,7 @@ class TwoPhaseSignalModel:
             return False
 
         return (
-            row["close"] > row["or_high"]                     # broke above OR
+            row["close"] > row["or_high"] * (1 + self.cfg.breakout_buffer_pct)  # A2: cleared OR_H by buffer
             and row["rvol_tod"] > self.cfg.rvol_threshold     # volume confirms
             and row["close_pos"] > self.cfg.close_pos_min     # strong close in bar
         )
@@ -270,9 +303,12 @@ class TwoPhaseSignalModel:
         if row["close"] < row["or_low"]:
             return "I3"
 
-        # I4: price ran > 1.5× ATR above or_high before any pullback
-        #     (runaway move — no pullback opportunity, skip)
-        if row["close"] > row["or_high"] + self.cfg.i4_atr_mult * row["atr"]:
+        # I4: highest_high_since_break ran > 1.5x ATR above or_high — v1.4 5.5:
+        #     "Price has run too far before pulling back. Stop/target math is
+        #     no longer valid from this base." Uses the TRACKED PEAK, not this
+        #     bar's own close -- a bar could be pulling back right now while
+        #     the earlier peak (a few bars ago) is what actually triggers this.
+        if state.highest_high > row["or_high"] + self.cfg.i4_atr_mult * row["atr"]:
             return "I4"
 
         return None
@@ -318,14 +354,19 @@ class TwoPhaseSignalModel:
 
     @staticmethod
     def _pullback_depth(
-        row: pd.Series, phase_a_close: float, or_high: float
+        row: pd.Series, highest_high: float, or_high: float
     ) -> float:
         """
-        How deeply did price pull back into the Phase A move?
+        How deeply did price pull back from its peak since Phase A?
 
-        depth = (phase_a_close - bar_low) / (phase_a_close - or_high)
+        v1.4 7.2: uses highest_high_since_break (the running peak reached
+        AFTER Phase A fired), NOT the Phase A bar's own close — if price
+        keeps running before pulling back, the true pullback is measured
+        from that higher peak, not from where Phase A happened to trigger.
 
-        0.0 = no pullback (bar stayed at Phase A close)
+        depth = (highest_high - bar_low) / (highest_high - or_high)
+
+        0.0 = no pullback (bar stayed at the peak)
         0.5 = pulled back halfway into the breakout move
         1.0 = fully retraced back to or_high
 
@@ -333,10 +374,10 @@ class TwoPhaseSignalModel:
         I1b invalidates the bar (and never scores it) as soon as this value is
         computed to be > 1.0.
         """
-        move = phase_a_close - or_high
+        move = highest_high - or_high
         if move <= 0:
             return np.nan
-        return (phase_a_close - row["low"]) / move
+        return (highest_high - row["low"]) / move
 
     # ── Validation ─────────────────────────────────────────────────────────────
 
@@ -362,7 +403,7 @@ class TwoPhaseSignalModel:
         b_attempts = df["phase_b_window"].sum()
 
         print(f"\n{'='*55}")
-        print(f"[Signal] model_version=1.2 (phase_a_seen lock + I1b depth-based check)")
+        print(f"[Signal] model_version=1.3 (v1.4 spec fixes: A2 buffer, B1 gate, highest_high tracking, next-bar-open fill)")
         print(f"[Signal] {sessions} sessions  |  "
               f"{phase_a} Phase A setups  |  "
               f"{b_attempts} Phase B bars  |  "

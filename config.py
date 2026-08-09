@@ -66,7 +66,8 @@ class Settings:
     max_age_hours:   int   = 20            # cache TTL — refresh after market close
 
     # ── Session feature engineer (Step 2) ─────────────────────────────────────
-    or_end_bar:      int   = 6             # bars to define opening range (6 x 5min = 30min)
+    or_end_bar:      int   = 3             # bars to define opening range (3 x 5min = 15min) -- v1.4 spec
+    breakout_buffer_pct: float = 0.0015    # A2: close must clear OR_H by this % (v1.4 spec, was missing)
     entry_cutoff:    str   = "14:30"       # no new entries after this IST time
     squareoff_time:  str   = "15:15"       # hard square-off IST time
 
