@@ -176,6 +176,38 @@ class IntradayRiskManager:
 
     # ── Trade simulation ──────────────────────────────────────────────────────
 
+    def _check_bar_exit(
+        self, entry_price: float, stop: float, target: float, trail_level: float,
+        cost_per_share: float, trailed: bool, bar: pd.Series, bar_time,
+    ) -> tuple:
+        """
+        Checks ONE bar for exit conditions. Returns
+        (exit_price, exit_reason, updated_stop, updated_trailed).
+        exit_price/exit_reason are None if the position is still open.
+
+        Shared by simulate_trade() (backtest — loops over known future bars
+        all at once) and the paper-trading incremental position tracker
+        (checks one new LIVE bar at a time as it actually arrives, across
+        separate cron invocations) — keeping exit logic byte-identical
+        between the two so backtested and paper-traded behavior can never
+        silently diverge.
+        """
+        if bar_time >= _SQUAREOFF:
+            return bar["close"], "SQUAREOFF", stop, trailed
+
+        if not trailed and bar["high"] >= trail_level:
+            stop = entry_price + cost_per_share
+            trailed = True
+
+        if bar["low"] <= stop:
+            reason = "TRAIL_STOP" if trailed else "STOP"
+            return stop, reason, stop, trailed
+
+        if bar["high"] >= target:
+            return target, "TARGET", stop, trailed
+
+        return None, None, stop, trailed
+
     def simulate_trade(
         self, setup: TradeSetup, session_bars: pd.DataFrame
     ) -> TradeResult:
@@ -207,28 +239,12 @@ class IntradayRiskManager:
 
         for ts, bar in future_bars.iterrows():
             bar_time = ts.time()
-
-            # Hard square-off — always wins, checked first
-            if bar_time >= _SQUAREOFF:
-                exit_time, exit_price, exit_reason = ts, bar["close"], "SQUAREOFF"
-                break
-
-            # Trailing stop update: if this bar's high reached the 50%-of-target
-            # level and we haven't trailed yet, move stop to breakeven + costs
-            if not trailed and bar["high"] >= trail_level:
-                stop = entry_price + cost_per_share
-                trailed = True
-
-            # Stop check (using the possibly-just-updated stop)
-            if bar["low"] <= stop:
-                exit_time  = ts
-                exit_price = stop
-                exit_reason = "TRAIL_STOP" if trailed else "STOP"
-                break
-
-            # Target check
-            if bar["high"] >= target:
-                exit_time, exit_price, exit_reason = ts, target, "TARGET"
+            exit_price, exit_reason, stop, trailed = self._check_bar_exit(
+                entry_price, stop, target, trail_level, cost_per_share,
+                trailed, bar, bar_time,
+            )
+            if exit_reason is not None:
+                exit_time = ts
                 break
 
         # Fallback: ran out of bars without an explicit exit (shouldn't happen

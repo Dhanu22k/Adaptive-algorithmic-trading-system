@@ -11,7 +11,7 @@
 
 data_pipeline:          # Step 1
   cache_dir: data_cache
-  history_days: 30       # lookback window for historical fetch
+  history_days: 180       # lookback window for historical fetch
   interval: FIVE_MINUTE   # Angel One interval code
   max_age_hours: 20        # cache TTL — refresh after market close
 
