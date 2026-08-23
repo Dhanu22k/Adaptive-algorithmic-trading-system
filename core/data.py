@@ -693,7 +693,18 @@ class AngelDataPipeline:
 
         # Trim the warm-up buffer back off — it existed only to give RVOL_ToD
         # a real baseline, it isn't part of what the caller actually asked for.
-        cutoff = df.index.max() - pd.Timedelta(days=days)
+        #
+        # IMPORTANT: anchor the cutoff to actual wall-clock NOW, not to
+        # df.index.max() (whatever bar Angel One happened to return as
+        # "latest"). Stock and sector/futures data don't always have
+        # identical availability lag from Angel One's API — anchoring to
+        # each dataset's OWN "latest bar" let stock and sector windows
+        # silently drift apart by days-to-months over repeated fetches
+        # (confirmed in production: paper trading logs showed drift up to
+        # 145 days between a stock and its sector proxy). Anchoring both to
+        # the same real "now" keeps them consistent regardless of API lag.
+        now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+        cutoff  = now_ist - pd.Timedelta(days=days)
         df = df[df.index > cutoff]
 
         self.validator.validate(df, validate_label)
@@ -723,6 +734,30 @@ class AngelDataPipeline:
         self.cache.save(cache_key, df)
         return df
 
+    def _resolve_sector_config(self, config: InstrumentConfig) -> InstrumentConfig:
+        """Resolves the sector proxy's InstrumentConfig (auto-resolving the
+        FUTIDX token if needed). Extracted so both fetch_with_sector() and
+        fetch_fresh_today() can build an identical sector config without
+        duplicating the token-resolution logic."""
+        resolved_token = config.sector_token
+        resolved_exch  = config.sector_exchange
+
+        if not resolved_token:
+            fut = get_active_futures_token(config.sector_index)
+            resolved_token = fut["token"]
+            resolved_exch  = fut["exch_seg"]  # "NFO"
+
+        return InstrumentConfig(
+            ticker        = config.sector_index,
+            symbol_token  = resolved_token,
+            exchange      = resolved_exch,
+            sector_index  = "",
+            sector_token  = "",
+            sector_exchange = "NSE",
+            gap_threshold = config.gap_threshold,
+            name          = f"{config.sector_index} Proxy"
+        )
+
     def fetch_with_sector(self, config: InstrumentConfig,
                           days: int = 365,
                           use_cache: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -744,33 +779,77 @@ class AngelDataPipeline:
             return stock_df, sector_df
 
         # ── Cache miss — resolve token then fetch fresh sector data ──
-        resolved_token = config.sector_token
-        resolved_exch  = config.sector_exchange
-
-        if not resolved_token:
-            # Empty sector_token means "auto-resolve via nearest FUTIDX contract"
-            # (same fix as originally built for BANKNIFTY, now generalized —
-            # ALL NSE index tokens return 0 candles from Angel One's history
-            # API, not just BANKNIFTY's).
-            fut = get_active_futures_token(config.sector_index)
-            resolved_token = fut["token"]
-            resolved_exch  = fut["exch_seg"]  # "NFO"
-
-        sector_config = InstrumentConfig(
-            ticker        = config.sector_index,
-            symbol_token  = resolved_token,
-            exchange      = resolved_exch,
-            sector_index  = "",
-            sector_token  = "",
-            sector_exchange = "NSE",
-            gap_threshold = config.gap_threshold,
-            name          = f"{config.sector_index} Proxy"
-        )
+        sector_config = self._resolve_sector_config(config)
         sector_df = self._fetch_compute_trim(sector_config, days, config.sector_index)
         self.cache.save(sector_key, sector_df)
 
         self._check_date_alignment(stock_df, sector_df, config)
         return stock_df, sector_df
+
+    def fetch_fresh_today(
+        self, config: InstrumentConfig, days_history: int = 180, days_fresh: int = 3,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        For PAPER TRADING ONLY — do not use for backtesting.
+
+        fetch_with_sector()'s 20h cache TTL is correct for backtesting
+        (yesterday's closed sessions never change, so re-fetching them every
+        5 minutes would be wasteful) but WRONG for paper trading, where
+        today's session is still forming: a cron run at 9:20 AM would cache
+        that snapshot, and every run for the next 20 HOURS — the entire
+        rest of the trading day — would silently keep serving that same
+        stale 9:20 AM snapshot instead of seeing new bars as they close.
+        (This is exactly what happened in production — confirmed from two
+        weeks of paper_trading.log showing 'no bars for today yet' on every
+        single run.)
+
+        This method gets the best of both: the cached, properly-warmed-up
+        HISTORY (days_history, via the normal cached path — cheap, correct,
+        doesn't need to be fresh) merged with an ALWAYS-FRESH small recent
+        slice (days_fresh, bypasses cache entirely) that guarantees today's
+        actual latest bars are present, however recently they closed.
+        """
+        # Cached historical baseline (RVOL warm-up, ATR, etc. all correct)
+        stock_hist, sector_hist = self.fetch_with_sector(
+            config, days=days_history, use_cache=True
+        )
+
+        # ALWAYS fresh — bypasses cache, guarantees today's real latest bars
+        stock_fresh_raw = self.fetcher.fetch_full_history(config, days=days_fresh)
+        sector_config = self._resolve_sector_config(config)
+        sector_fresh_raw = self.fetcher.fetch_full_history(sector_config, days=days_fresh)
+
+        stock_df  = self._merge_and_recompute(stock_hist, stock_fresh_raw)
+        sector_df = self._merge_and_recompute(sector_hist, sector_fresh_raw)
+
+        self._check_date_alignment(stock_df, sector_df, config)
+        return stock_df, sector_df
+
+    def _merge_and_recompute(
+        self, cached_df: pd.DataFrame, fresh_raw_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Drops the (possibly stale) tail of cached_df overlapping fresh_raw_df's
+        range, appends the fresh raw OHLCV, then recomputes gap-check + RVOL
+        on the FULL merged frame — not just the fresh slice. RVOL_ToD needs
+        its expanding-window baseline built from real history; computing it
+        on only the 3-day fresh slice would give today's bars a thin, wrong
+        baseline instead of the properly warmed-up one the cached portion
+        already has.
+        """
+        if fresh_raw_df.empty:
+            return cached_df
+
+        cutoff = fresh_raw_df.index.min()
+        ohlcv_cols = ["open", "high", "low", "close", "volume"]
+        merged = pd.concat([
+            cached_df[cached_df.index < cutoff][ohlcv_cols],
+            fresh_raw_df[ohlcv_cols],
+        ]).sort_index()
+
+        merged = self.gap_check.check(merged)
+        merged = self.rvol_calc.compute(merged)
+        return merged
 
     @staticmethod
     def _check_date_alignment(

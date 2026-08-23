@@ -173,11 +173,14 @@ class PaperTradingEngine:
     def _process_instrument(self, ticker: str) -> None:
         config = InstrumentConfig.from_ticker(ticker)
 
-        # use_cache=True: history portion reuses the existing 20h-TTL cache.
-        # Today's still-forming session is always included in whatever the
-        # underlying fetch returns as the most recent data available.
-        stock_df, sector_df = self.pipeline.fetch_with_sector(
-            config, days=self.history_days
+        # fetch_fresh_today, NOT fetch_with_sector: the 20h cache TTL is
+        # correct for backtesting but was the root cause of paper trading
+        # never seeing new intraday bars (confirmed from production logs —
+        # every run hit "no bars for today yet"). This merges the cheap
+        # cached history with an always-fresh recent slice, so today's
+        # actual latest bars are guaranteed present every single run.
+        stock_df, sector_df = self.pipeline.fetch_fresh_today(
+            config, days_history=self.history_days
         )
         features_df = self.sfe.compute(stock_df, sector_df, config)
         signals_df  = self.signal_model.generate(features_df)
