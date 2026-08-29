@@ -186,63 +186,125 @@ def _parse_angel_expiry(expiry_str: str) -> date:
 
 @lru_cache(maxsize=1)
 def _fetch_scrip_master() -> tuple:
-    """Fetch ScripMaster JSON once per process and cache it in memory.
-    The file is ~50 MB so we use a generous timeout and one retry.
-    """
-    print("[SectorProxy] Fetching ScripMaster (~50 MB) to resolve sector tokens...")
-    for attempt in range(1, 3):  # 2 attempts
+    cache_dir = Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+
+    cache_path = cache_dir / "scrip_master.json"
+
+    if cache_path.exists():
+        modified = datetime.fromtimestamp(cache_path.stat().st_mtime).date()
+
+        if modified == date.today():
+            try:
+                with cache_path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                if isinstance(data, list) and data:
+                    print(
+                        f"[SectorProxy] Loaded ScripMaster from cache "
+                        f"({len(data)} entries)"
+                    )
+                    return tuple(data)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    print("[SectorProxy] Fetching ScripMaster (~50 MB)...")
+
+    for attempt in range(1, 3):
         try:
             resp = requests.get(_SCRIP_MASTER_URL, timeout=90)
             resp.raise_for_status()
-            return tuple(resp.json())
-        except requests.exceptions.RequestException as exc:
+            data = resp.json()
+
+            if not isinstance(data, list) or not data:
+                raise RuntimeError("ScripMaster response is empty or invalid")
+
+            temp_path = cache_path.with_suffix(".tmp")
+
+            with temp_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+            temp_path.replace(cache_path)
+
+            print(
+                f"[SectorProxy] ScripMaster cached "
+                f"({len(data)} entries)"
+            )
+
+            return tuple(data)
+
+        except (
+            requests.exceptions.RequestException,
+            ValueError,
+            OSError,
+        ) as exc:
             if attempt == 2:
                 raise RuntimeError(
-                    f"[SectorProxy] ScripMaster fetch failed after 2 attempts: {exc}\n"
-                    "  Check network connectivity or try again in a moment."
+                    f"[SectorProxy] ScripMaster fetch failed after "
+                    f"2 attempts: {exc}"
                 ) from exc
-            print(f"[SectorProxy] Attempt {attempt} timed out — retrying...")
 
+            print(
+                f"[SectorProxy] Attempt {attempt} failed — retrying..."
+            )
+            time.sleep(2)
 
 def get_active_futures_token(underlying_name: str) -> dict:
-    """
-    Returns the nearest-expiry FUTIDX contract for ANY underlying index.
-    Auto-rolls monthly. Generalized version of the original BANKNIFTY-only
-    resolver — same fix now works for NIFTY, CNXIT/NIFTYIT, etc.
+    cache_dir = Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
 
-    Parameters
-    ----------
-    underlying_name : the ScripMaster "name" field to match EXACTLY, e.g.
-        "BANKNIFTY", "NIFTY". Uses exact equality, NOT substring match —
-        substring matching on "NIFTY" would incorrectly also match
-        "BANKNIFTY" and "NIFTYIT" contracts, since both contain "NIFTY".
+    token_cache_path = cache_dir / "sector_tokens.json"
 
-    Returns dict with keys:
-        token    (str)  e.g. '61088'
-        symbol   (str)  e.g. 'BANKNIFTY28JUL26FUT'
-        expiry   (date) e.g. date(2026, 7, 28)
-        exch_seg (str)  always 'NFO'
+    token_cache = {}
 
-    Raises RuntimeError if no active contract is found — this is a LOUD,
-    immediate failure (unlike the original bug it replaces, which silently
-    returned 0 candles). If this fires, the underlying_name likely doesn't
-    match ScripMaster's exact "name" field — inspect a sample entry to check.
-    """
+    if token_cache_path.exists():
+        try:
+            with token_cache_path.open("r", encoding="utf-8") as f:
+                token_cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            token_cache = {}
+
+    today_key = date.today().isoformat()
+
+    cached = token_cache.get(underlying_name)
+
+    if cached and cached.get("date") == today_key:
+        try:
+            expiry_dt = _parse_angel_expiry(cached["expiry"])
+
+            if expiry_dt >= date.today():
+                print(
+                    f"[SectorProxy] Using cached {cached['symbol']} "
+                    f"token={cached['token']} expiry={expiry_dt}"
+                )
+
+                return {
+                    "token": cached["token"],
+                    "symbol": cached["symbol"],
+                    "expiry": expiry_dt,
+                    "exch_seg": cached["exch_seg"],
+                }
+        except (KeyError, ValueError):
+            pass
+
     today = date.today()
     candidates = []
 
     for item in _fetch_scrip_master():
-        if (item.get("exch_seg") == "NFO"
-                and item.get("name") == underlying_name   # EXACT match — see docstring
-                and item.get("instrumenttype") == "FUTIDX"
-                and item.get("expiry", "")):
+        if (
+            item.get("exch_seg") == "NFO"
+            and item.get("name") == underlying_name
+            and item.get("instrumenttype") == "FUTIDX"
+            and item.get("expiry", "")
+        ):
             try:
                 expiry_dt = _parse_angel_expiry(item["expiry"])
-                if expiry_dt >= today:  # include expiry day (tradeable intraday)
+
+                if expiry_dt >= today:
                     candidates.append({
-                        "token"   : item["token"],
-                        "symbol"  : item["symbol"],
-                        "expiry"  : expiry_dt,
+                        "token": item["token"],
+                        "symbol": item["symbol"],
+                        "expiry": expiry_dt,
                         "exch_seg": "NFO",
                     })
             except (KeyError, ValueError):
@@ -250,17 +312,32 @@ def get_active_futures_token(underlying_name: str) -> dict:
 
     if not candidates:
         raise RuntimeError(
-            f"No active {underlying_name} FUTIDX found in ScripMaster. "
-            f"The 'name' field may not match exactly — try inspecting a raw "
-            f"ScripMaster entry for this underlying to confirm the correct name."
+            f"No active {underlying_name} FUTIDX found in ScripMaster."
         )
 
     candidates.sort(key=lambda x: x["expiry"])
     active = candidates[0]
+
+    token_cache[underlying_name] = {
+        "date": today_key,
+        "token": active["token"],
+        "symbol": active["symbol"],
+        "expiry": active["expiry"].strftime("%d%b%Y").upper(),
+        "exch_seg": active["exch_seg"],
+    }
+
+    temp_path = token_cache_path.with_suffix(".tmp")
+
+    with temp_path.open("w", encoding="utf-8") as f:
+        json.dump(token_cache, f)
+
+    temp_path.replace(token_cache_path)
+
     print(
-        f"[SectorProxy] Using {active['symbol']}  "
-        f"token={active['token']}  expiry={active['expiry']}"
+        f"[SectorProxy] Using {active['symbol']} "
+        f"token={active['token']} expiry={active['expiry']}"
     )
+
     return active
 
 
@@ -285,14 +362,10 @@ class AngelAuthenticator:
 
     def _base_headers(self) -> dict:
         return {
-            "Content-Type":      "application/json",
-            "Accept":            "application/json",
-            "X-UserType":        "USER",
-            "X-SourceID":        "WEB",
-            "X-ClientLocalIP":   "127.0.0.1",
-            "X-ClientPublicIP":  "127.0.0.1",
-            "X-MACAddress":      "00:00:00:00:00:00",
-            "X-PrivateKey":      self.api_key,
+            "Content-Type": "application/json",
+            "X-SourceID": "WEB",
+            "X-MACAddress": "00:00:00:00:00:00",
+            "X-PrivateKey": self.api_key,
         }
 
     def _token_is_fresh(self) -> bool:
@@ -355,95 +428,203 @@ class HistoricalDataFetcher:
     def __init__(self, auth: AngelAuthenticator):
         self.auth = auth
 
-    def fetch_candles(self, token: str, exchange: str,
-                      from_dt: datetime, to_dt: datetime,
-                      interval: str = "FIVE_MINUTE") -> list:
-        """Fetch raw candles for one time window. Returns list of
-        [timestamp, open, high, low, close, volume] lists."""
+    def fetch_candles(
+        self,
+        token: str,
+        exchange: str,
+        from_dt: datetime,
+        to_dt: datetime,
+        interval: str = "FIVE_MINUTE",
+    ) -> Optional[list]:
         payload = {
-            "exchange":    exchange,
+            "exchange": exchange,
             "symboltoken": token,
-            "interval":    interval,
-            "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
-            "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
+            "interval": interval,
+            "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        headers = self.auth.get_auth_headers()
-        resp = requests.post(self.HIST_URL, headers=headers,
-                             json=payload, timeout=20)
 
-        # Diagnostic: reveal WHY a non-JSON response happened, instead of
-        # crashing blind on resp.json(). Empty body / non-200 status is
-        # commonly a silent IP block or rate limit from the broker's side,
-        # not a code bug -- this makes that visible instead of guessing.
-        if resp.status_code != 200:
-            print(f"  [Fetch] HTTP {resp.status_code} — {resp.reason}")
-            print(f"  [Fetch] Response body (first 500 chars): {resp.text[:500]!r}")
-            print(f"  [Fetch] Response headers: {dict(resp.headers)}")
-            return []
+        max_attempts = 4
 
-        try:
-            data = resp.json()
-        except ValueError:
-            print(f"  [Fetch] Non-JSON response despite HTTP 200. "
-                  f"Body (first 500 chars): {resp.text[:500]!r}")
-            return []
+        for attempt in range(1, max_attempts + 1):
+            try:
+                headers = self.auth.get_auth_headers()
 
-        if not data.get("status"):
-            print(f"  [Fetch] Warning: {data.get('message')} "
-                  f"(token={token}, {from_dt.date()} to {to_dt.date()})")
-            return []
-        return data.get("data", [])
+                resp = requests.post(
+                    self.HIST_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=20,
+                )
+
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        print(
+                            f"  [Fetch] Non-JSON response despite HTTP 200. "
+                            f"Body (first 500 chars): {resp.text[:500]!r}"
+                        )
+                        return None
+
+                    if not data.get("status"):
+                        print(
+                            f"  [Fetch] Warning: {data.get('message')} "
+                            f"(token={token}, {from_dt.date()} to {to_dt.date()})"
+                        )
+                        return None
+
+                    return data.get("data", [])
+
+                rate_limited = resp.status_code in (403, 429)
+
+                if not rate_limited:
+                    print(
+                        f"  [Fetch] HTTP {resp.status_code} — {resp.reason}"
+                    )
+                    print(
+                        f"  [Fetch] Response body (first 500 chars): "
+                        f"{resp.text[:500]!r}"
+                    )
+                    return None
+
+                if attempt == max_attempts:
+                    print(
+                        f"  [Fetch] HTTP {resp.status_code} after "
+                        f"{max_attempts} attempts — rate limit persisted"
+                    )
+                    print(
+                        f"  [Fetch] Response body (first 500 chars): "
+                        f"{resp.text[:500]!r}"
+                    )
+                    return None
+
+                wait_seconds = 5 * (2 ** (attempt - 1))
+
+                print(
+                    f"  [Fetch] HTTP {resp.status_code} rate limit "
+                    f"(attempt {attempt}/{max_attempts}) — "
+                    f"waiting {wait_seconds}s"
+                )
+
+                time.sleep(wait_seconds)
+
+            except requests.exceptions.RequestException as exc:
+                if attempt == max_attempts:
+                    print(
+                        f"  [Fetch] Request failed after "
+                        f"{max_attempts} attempts: {exc}"
+                    )
+                    return None
+
+                wait_seconds = 5 * (2 ** (attempt - 1))
+
+                print(
+                    f"  [Fetch] Request error "
+                    f"(attempt {attempt}/{max_attempts}): {exc} — "
+                    f"waiting {wait_seconds}s"
+                )
+
+                time.sleep(wait_seconds)
+
+        return None
 
     def fetch_full_history(self, config: InstrumentConfig,
-                           days: int = 365) -> pd.DataFrame:
-        """Fetch `days` of 5-min data, splitting into 30-day chunks.
-        Returns a DataFrame with DatetimeIndex (bar-close, IST).
-        """
-        print(f"\n[Fetch] {config.name} ({config.ticker})"
-              f" — requesting {days} days of 5-min data")
+                       days: int = 365) -> pd.DataFrame:
+        print(
+            f"\n[Fetch] {config.name} ({config.ticker})"
+            f" — requesting {days} days of 5-min data"
+        )
 
-        to_dt   = datetime.now()
+        to_dt = datetime.now()
         from_dt = to_dt - timedelta(days=days)
-
         all_candles = []
+
         chunk_start = from_dt
+        chunk_number = 0
+        total_chunks = 0
+
+        probe = from_dt
+        while probe < to_dt:
+            total_chunks += 1
+            probe = min(probe + timedelta(days=30), to_dt) + timedelta(minutes=5)
 
         while chunk_start < to_dt:
-            chunk_end = min(chunk_start + timedelta(days=29), to_dt)
-            print(f"  Chunk: {chunk_start.date()} → {chunk_end.date()}")
+            chunk_number += 1
+            chunk_end = min(chunk_start + timedelta(days=30), to_dt)
+
+            print(
+                f"  Chunk {chunk_number}/{total_chunks}: "
+                f"{chunk_start.date()} → {chunk_end.date()}"
+            )
 
             candles = self.fetch_candles(
-                config.symbol_token, config.exchange,
-                chunk_start, chunk_end
+                config.symbol_token,
+                config.exchange,
+                chunk_start,
+                chunk_end,
             )
+
+            if candles is None:
+                raise RuntimeError(
+                    f"Historical fetch failed for {config.ticker} "
+                    f"on chunk {chunk_start.date()} → {chunk_end.date()}. "
+                    f"Partial data will not be accepted or cached."
+                )
+
             all_candles.extend(candles)
+
             chunk_start = chunk_end + timedelta(minutes=5)
-            time.sleep(1)  # rate limiting
+
+            if chunk_start < to_dt:
+                time.sleep(1)
 
         df = self._to_dataframe(all_candles)
+
+        if df.empty:
+            raise RuntimeError(
+                f"No historical data returned for {config.ticker} "
+                f"over the requested {days}-day window."
+            )
+
         print(f"  Raw candles: {len(df)}")
         return df
 
     def _to_dataframe(self, candles: list) -> pd.DataFrame:
         if not candles:
             return pd.DataFrame()
-        df = pd.DataFrame(candles,
-                          columns=["datetime", "open", "high",
-                                   "low", "close", "volume"])
-        # Parse timestamps — Angel One returns ISO8601 with IST offset
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=False)
 
-        # Normalize to bar-CLOSE timestamp (architecture W19 requirement)
-        # Angel One returns bar-START timestamps — add 5 minutes
+        df = pd.DataFrame(
+            candles,
+            columns=[
+                "datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ],
+        )
+
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata")
         df["datetime"] = df["datetime"] + pd.Timedelta(minutes=5)
 
         df = df.set_index("datetime")
-        df = df.astype({"open": float, "high": float,
-                        "low": float, "close": float, "volume": float})
-        df = df.sort_index()
-        df = df[~df.index.duplicated(keep="last")]  # remove duplicates
-        return df
+        df.index = pd.DatetimeIndex(df.index)
 
+        df = df.astype({
+            "open": float,
+            "high": float,
+            "low": float,
+            "close": float,
+            "volume": float,
+        })
+
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
+        return df
 
 # ---------------------------------------------------------------------------
 # MISSING BAR DETECTOR (W22)
@@ -629,9 +810,20 @@ class LocalCache:
 
     def load(self, key: str) -> pd.DataFrame:
         df = pd.read_parquet(self._path(key))
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
+        elif df.index.tz is None:
+            df.index = df.index.tz_localize("Asia/Kolkata")
+        else:
+            df.index = df.index.tz_convert("Asia/Kolkata")
+
+        df.index = pd.DatetimeIndex(df.index)
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
         print(f"[Cache] Loaded {key} from cache ({len(df)} rows)")
         return df
-
 
 # ---------------------------------------------------------------------------
 # MAIN PIPELINE
@@ -787,68 +979,111 @@ class AngelDataPipeline:
         return stock_df, sector_df
 
     def fetch_fresh_today(
-        self, config: InstrumentConfig, days_history: int = 180, days_fresh: int = 3,
+    self, config: InstrumentConfig, days_history: int = 180, days_fresh: int = 1,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        For PAPER TRADING ONLY — do not use for backtesting.
+        stock_key = f"{config.ticker}_{days_history}d_5min"
+        sector_key = f"{config.sector_index}_{days_history}d_5min"
 
-        fetch_with_sector()'s 20h cache TTL is correct for backtesting
-        (yesterday's closed sessions never change, so re-fetching them every
-        5 minutes would be wasteful) but WRONG for paper trading, where
-        today's session is still forming: a cron run at 9:20 AM would cache
-        that snapshot, and every run for the next 20 HOURS — the entire
-        rest of the trading day — would silently keep serving that same
-        stale 9:20 AM snapshot instead of seeing new bars as they close.
-        (This is exactly what happened in production — confirmed from two
-        weeks of paper_trading.log showing 'no bars for today yet' on every
-        single run.)
+        if not self.cache.exists(stock_key):
+            raise RuntimeError(
+                f"Historical cache missing for {config.ticker}: {stock_key}. "
+                f"Bootstrap the historical cache before starting paper trading."
+            )
 
-        This method gets the best of both: the cached, properly-warmed-up
-        HISTORY (days_history, via the normal cached path — cheap, correct,
-        doesn't need to be fresh) merged with an ALWAYS-FRESH small recent
-        slice (days_fresh, bypasses cache entirely) that guarantees today's
-        actual latest bars are present, however recently they closed.
-        """
-        # Cached historical baseline (RVOL warm-up, ATR, etc. all correct)
-        stock_hist, sector_hist = self.fetch_with_sector(
-            config, days=days_history, use_cache=True
+        if not self.cache.exists(sector_key):
+            raise RuntimeError(
+                f"Historical cache missing for {config.sector_index}: {sector_key}. "
+                f"Bootstrap the historical cache before starting paper trading."
+            )
+
+        stock_hist = self.cache.load(stock_key)
+        sector_hist = self.cache.load(sector_key)
+
+        stock_fresh_raw = self.fetcher.fetch_full_history(
+            config, days=days_fresh
         )
 
-        # ALWAYS fresh — bypasses cache, guarantees today's real latest bars
-        stock_fresh_raw = self.fetcher.fetch_full_history(config, days=days_fresh)
         sector_config = self._resolve_sector_config(config)
-        sector_fresh_raw = self.fetcher.fetch_full_history(sector_config, days=days_fresh)
 
-        stock_df  = self._merge_and_recompute(stock_hist, stock_fresh_raw)
-        sector_df = self._merge_and_recompute(sector_hist, sector_fresh_raw)
+        sector_fresh_raw = self.fetcher.fetch_full_history(
+            sector_config, days=days_fresh
+        )
+
+        stock_df = self._merge_and_recompute(
+            stock_hist, stock_fresh_raw
+        )
+
+        sector_df = self._merge_and_recompute(
+            sector_hist, sector_fresh_raw
+        )
 
         self._check_date_alignment(stock_df, sector_df, config)
+
         return stock_df, sector_df
 
+
     def _merge_and_recompute(
-        self, cached_df: pd.DataFrame, fresh_raw_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        Drops the (possibly stale) tail of cached_df overlapping fresh_raw_df's
-        range, appends the fresh raw OHLCV, then recomputes gap-check + RVOL
-        on the FULL merged frame — not just the fresh slice. RVOL_ToD needs
-        its expanding-window baseline built from real history; computing it
-        on only the 3-day fresh slice would give today's bars a thin, wrong
-        baseline instead of the properly warmed-up one the cached portion
-        already has.
-        """
+        self,
+        cached_df: pd.DataFrame,
+        fresh_raw_df: pd.DataFrame,
+        ) -> pd.DataFrame:
         if fresh_raw_df.empty:
             return cached_df
 
+        cached_df = cached_df.copy()
+        fresh_raw_df = fresh_raw_df.copy()
+
+        if not isinstance(cached_df.index, pd.DatetimeIndex):
+            cached_df.index = pd.to_datetime(cached_df.index, utc=True)
+        elif cached_df.index.tz is None:
+            cached_df.index = cached_df.index.tz_localize("Asia/Kolkata")
+        else:
+            cached_df.index = cached_df.index.tz_convert("Asia/Kolkata")
+
+        if not isinstance(fresh_raw_df.index, pd.DatetimeIndex):
+            fresh_raw_df.index = pd.to_datetime(
+                fresh_raw_df.index,
+                utc=True,
+            )
+        elif fresh_raw_df.index.tz is None:
+            fresh_raw_df.index = fresh_raw_df.index.tz_localize(
+                "Asia/Kolkata"
+            )
+        else:
+            fresh_raw_df.index = fresh_raw_df.index.tz_convert(
+                "Asia/Kolkata"
+            )
+
+        cached_df.index = pd.DatetimeIndex(cached_df.index)
+        fresh_raw_df.index = pd.DatetimeIndex(fresh_raw_df.index)
+
+        cached_df = cached_df.sort_index()
+        fresh_raw_df = fresh_raw_df.sort_index()
+
         cutoff = fresh_raw_df.index.min()
-        ohlcv_cols = ["open", "high", "low", "close", "volume"]
+
+        ohlcv_cols = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+
         merged = pd.concat([
-            cached_df[cached_df.index < cutoff][ohlcv_cols],
+            cached_df.loc[
+                cached_df.index < cutoff,
+                ohlcv_cols,
+            ],
             fresh_raw_df[ohlcv_cols],
         ]).sort_index()
 
+        merged.index = pd.DatetimeIndex(merged.index)
+        merged = merged[~merged.index.duplicated(keep="last")]
+
         merged = self.gap_check.check(merged)
         merged = self.rvol_calc.compute(merged)
+
         return merged
 
     @staticmethod
